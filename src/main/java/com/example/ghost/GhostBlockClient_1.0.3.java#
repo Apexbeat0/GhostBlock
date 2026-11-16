@@ -1,0 +1,291 @@
+package com.example.ghost;
+
+import com.mojang.brigadier.arguments.DoubleArgumentType;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.minecraft.client.Minecraft;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import static net.fabricmc.fabric.api.client.command.v2.ClientCommands.argument;
+import static net.fabricmc.fabric.api.client.command.v2.ClientCommands.literal;
+
+/**
+ * Client-side only "ghost block" tool.
+ *
+ * /ghost                 -> hides the block you are looking at
+ * /ghost <range>         -> same, but with a custom raycast distance
+ * /ghost radius <n>      -> hides every block within n blocks (sphere) of your target
+ * /ghost <blockname>     -> hides every block of that type near you
+ * /ghost undo            -> reverts the last /ghost command as a whole
+ * /ghost clear           -> brings back every hidden block
+ * /ghost help            -> lists these commands
+ *
+ * Nothing is sent to the server: only your own client's copy of the world is edited.
+ *
+ * Each /ghost invocation -- whether it hid one block or a hundred -- is
+ * recorded as a single batch. /ghost undo always reverts the most recent
+ * batch as a whole, not one block at a time.
+ *
+ * Whenever the *server* puts a real block back at a position we hid -- because
+ * you died and it resent the area, because you right-clicked something we'd
+ * turned into air and it corrected the desync, or for any other reason -- our
+ * bookkeeping for that position is stale. We reconcile every client tick: any
+ * hidden position that is no longer air on the client gets silently dropped
+ * from tracking. No chat message, nothing to restore, since the block is
+ * already back on its own. (A position dropped this way is simply skipped
+ * the next time its batch is undone -- see undo() below.)
+ */
+public class GhostBlockClient implements ClientModInitializer {
+
+    /** Every currently-hidden position, mapped to the state it had before. */
+    private static final Map<BlockPos, BlockState> HIDDEN = new LinkedHashMap<>();
+
+    /** One entry per /ghost invocation that hid at least one block, oldest first. */
+    private static final Deque<List<BlockPos>> BATCHES = new ArrayDeque<>();
+
+    /** Max radius for "/ghost radius <n>", to keep it from freezing the game. */
+    private static final int MAX_RADIUS = 16;
+
+    /** How far around the player "/ghost <blockname>" scans for matching blocks. */
+    private static final int BLOCK_NAME_SCAN_RADIUS = 24;
+
+    @Override
+    public void onInitializeClient() {
+        ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
+                dispatcher.register(literal("ghost")
+                        .executes(ctx -> hide(ctx.getSource(), -1.0D))
+                        .then(literal("undo")
+                                .executes(ctx -> undo(ctx.getSource())))
+                        .then(literal("clear")
+                                .executes(ctx -> clear(ctx.getSource())))
+                        .then(literal("help")
+                                .executes(ctx -> showHelp(ctx.getSource())))
+                        .then(literal("radius")
+                                .then(argument("n", IntegerArgumentType.integer(1, MAX_RADIUS))
+                                        .executes(ctx -> hideRadius(ctx.getSource(),
+                                                IntegerArgumentType.getInteger(ctx, "n")))))
+                        // Numeric "range" argument registered BEFORE the block-name
+                        // argument: brigadier tries sibling argument nodes in
+                        // registration order, so "/ghost 50" matches the double
+                        // parser first and only falls through to the word parser
+                        // (matches anything) when the input isn't a number.
+                        .then(argument("range", DoubleArgumentType.doubleArg(1.0D, 128.0D))
+                                .executes(ctx -> hide(ctx.getSource(),
+                                        DoubleArgumentType.getDouble(ctx, "range"))))
+                        .then(argument("block", StringArgumentType.word())
+                                .executes(ctx -> hideByName(ctx.getSource(),
+                                        StringArgumentType.getString(ctx, "block"))))));
+
+        ClientTickEvents.END_CLIENT_TICK.register(GhostBlockClient::reconcile);
+    }
+
+    /** Drops bookkeeping for any hidden position the server has silently un-hidden. */
+    private static void reconcile(Minecraft mc) {
+        if (mc.level == null || HIDDEN.isEmpty()) {
+            return;
+        }
+        HIDDEN.entrySet().removeIf(entry -> {
+            BlockPos pos = entry.getKey();
+            if (!mc.level.isLoaded(pos)) {
+                return false; // can't verify right now, leave it tracked
+            }
+            return !mc.level.getBlockState(pos).isAir();
+        });
+    }
+
+    private static int showHelp(FabricClientCommandSource source) {
+        source.sendFeedback(Component.literal("§6--- Ghost Block ---"));
+        source.sendFeedback(Component.literal("§f/ghost §7- hide the block you're looking at"));
+        source.sendFeedback(Component.literal("§f/ghost <range> §7- same, with a custom reach distance"));
+        source.sendFeedback(Component.literal("§f/ghost radius <n> §7- hide every block within n blocks of your target (max " + MAX_RADIUS + ")"));
+        source.sendFeedback(Component.literal("§f/ghost <blockname> §7- hide every block of that type within " + BLOCK_NAME_SCAN_RADIUS + " blocks of you"));
+        source.sendFeedback(Component.literal("§f/ghost undo §7- revert the last /ghost command as a whole"));
+        source.sendFeedback(Component.literal("§f/ghost clear §7- bring back every hidden block"));
+        source.sendFeedback(Component.literal("§f/ghost help §7- show this message"));
+        return 1;
+    }
+
+    private static int hide(FabricClientCommandSource source, double range) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.level == null || mc.player == null) {
+            return 0;
+        }
+
+        // range < 0 -> use the crosshair target the game already calculated this frame
+        HitResult hit = range < 0
+                ? mc.hitResult
+                : mc.player.pick(range, 1.0F, false);
+
+        if (!(hit instanceof BlockHitResult blockHit) || hit.getType() != HitResult.Type.BLOCK) {
+            source.sendFeedback(Component.literal("§cNo block in sight."));
+            return 0;
+        }
+
+        BlockPos pos = blockHit.getBlockPos().immutable();
+        BlockState old = mc.level.getBlockState(pos);
+
+        if (old.isAir()) {
+            source.sendFeedback(Component.literal("§cThat position is already empty."));
+            return 0;
+        }
+
+        hideOne(mc, pos, old);
+        BATCHES.addLast(List.of(pos));
+
+        source.sendFeedback(Component.literal(
+                "§7Hidden §f" + old.getBlock().getName().getString()
+                        + " §7at §f" + pos.getX() + " " + pos.getY() + " " + pos.getZ()));
+        return 1;
+    }
+
+    private static int hideRadius(FabricClientCommandSource source, int radius) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.level == null || mc.player == null) {
+            return 0;
+        }
+
+        HitResult hit = mc.hitResult;
+        BlockPos center = (hit instanceof BlockHitResult blockHit && hit.getType() == HitResult.Type.BLOCK)
+                ? blockHit.getBlockPos()
+                : mc.player.blockPosition();
+
+        List<BlockPos> batch = new ArrayList<>();
+        long radiusSq = (long) radius * radius;
+        for (BlockPos pos : BlockPos.betweenClosed(
+                center.offset(-radius, -radius, -radius),
+                center.offset(radius, radius, radius))) {
+            if (pos.distSqr(center) > radiusSq) {
+                continue; // keep it a sphere rather than a cube
+            }
+            BlockState state = mc.level.getBlockState(pos);
+            if (state.isAir()) {
+                continue;
+            }
+            BlockPos immut = pos.immutable();
+            hideOne(mc, immut, state);
+            batch.add(immut);
+        }
+
+        if (!batch.isEmpty()) {
+            BATCHES.addLast(batch);
+        }
+
+        source.sendFeedback(Component.literal(
+                "§7Hidden §f" + batch.size() + " §7block(s) within radius §f" + radius + "§7."));
+        return batch.size();
+    }
+
+    private static int hideByName(FabricClientCommandSource source, String rawName) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.level == null || mc.player == null) {
+            return 0;
+        }
+
+        Identifier id = rawName.contains(":")
+                ? Identifier.tryParse(rawName)
+                : Identifier.tryBuild("minecraft", rawName);
+
+        if (id == null) {
+            source.sendFeedback(Component.literal("§cInvalid block name: " + rawName));
+            return 0;
+        }
+
+        Block target = BuiltInRegistries.BLOCK.getOptional(id).orElse(null);
+        if (target == null) {
+            source.sendFeedback(Component.literal("§cUnknown block: " + id));
+            return 0;
+        }
+
+        BlockPos center = mc.player.blockPosition();
+        List<BlockPos> batch = new ArrayList<>();
+        for (BlockPos pos : BlockPos.betweenClosed(
+                center.offset(-BLOCK_NAME_SCAN_RADIUS, -BLOCK_NAME_SCAN_RADIUS, -BLOCK_NAME_SCAN_RADIUS),
+                center.offset(BLOCK_NAME_SCAN_RADIUS, BLOCK_NAME_SCAN_RADIUS, BLOCK_NAME_SCAN_RADIUS))) {
+            BlockState state = mc.level.getBlockState(pos);
+            if (!state.is(target)) {
+                continue;
+            }
+            BlockPos immut = pos.immutable();
+            hideOne(mc, immut, state);
+            batch.add(immut);
+        }
+
+        if (!batch.isEmpty()) {
+            BATCHES.addLast(batch);
+        }
+
+        source.sendFeedback(Component.literal(
+                "§7Hidden §f" + batch.size() + " §7" + target.getName().getString()
+                        + " §7block(s) within §f" + BLOCK_NAME_SCAN_RADIUS + " §7blocks of you."));
+        return batch.size();
+    }
+
+    /** Records the original state and swaps the position to client-side air. */
+    private static void hideOne(Minecraft mc, BlockPos pos, BlockState old) {
+        HIDDEN.putIfAbsent(pos, old);
+        mc.level.setBlock(pos, Blocks.AIR.defaultBlockState(), Block.UPDATE_ALL);
+    }
+
+    /**
+     * Reverts the most recent /ghost batch as a whole. Positions in that batch
+     * which reconcile() already dropped (because the server put the real block
+     * back on its own) are just skipped -- if the whole batch turns out to be
+     * stale, we fall through to the batch before it instead of reporting
+     * "nothing to restore" for no reason.
+     */
+    private static int undo(FabricClientCommandSource source) {
+        while (!BATCHES.isEmpty()) {
+            List<BlockPos> batch = BATCHES.removeLast();
+            int restored = 0;
+            for (BlockPos pos : batch) {
+                BlockState state = HIDDEN.remove(pos);
+                if (state != null) {
+                    applyBack(pos, state);
+                    restored++;
+                }
+            }
+            if (restored > 0) {
+                source.sendFeedback(Component.literal("§7Restored " + restored + " block(s)."));
+                return restored;
+            }
+            // Entire batch was already reconciled away -- try the one before it.
+        }
+        source.sendFeedback(Component.literal("§cNothing to restore."));
+        return 0;
+    }
+
+    private static int clear(FabricClientCommandSource source) {
+        int count = HIDDEN.size();
+        HIDDEN.forEach(GhostBlockClient::applyBack);
+        HIDDEN.clear();
+        BATCHES.clear();
+        source.sendFeedback(Component.literal("§7Restored " + count + " block(s)."));
+        return count;
+    }
+
+    private static void applyBack(BlockPos pos, BlockState state) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.level != null && mc.level.isLoaded(pos)) {
+            mc.level.setBlock(pos, state, Block.UPDATE_ALL);
+        }
+    }
+}
